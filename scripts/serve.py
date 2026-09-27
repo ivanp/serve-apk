@@ -6,11 +6,14 @@ Zero external dependencies (standard library only).
 
 import argparse
 import os
+import re
+import signal
 import socket
 import sys
 import threading
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlparse
 
 
 def get_ip_addresses():
@@ -48,42 +51,74 @@ def get_ip_addresses():
 
 
 def find_free_port(preferred_port=8080):
-    """Find preferred_port or next available port."""
-    for port in range(preferred_port, preferred_port + 50):
+    """Find preferred_port or next available port within valid TCP range (1-65535)."""
+    if not (1 <= preferred_port <= 65535):
+        preferred_port = 8080
+
+    max_port = min(preferred_port + 50, 65536)
+    for port in range(preferred_port, max_port):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind(("", port))
                 return port
         except OSError:
             continue
-    raise RuntimeError(f"No free ports found starting from {preferred_port}")
+    raise RuntimeError(f"No free ports found in range {preferred_port}-{max_port - 1}")
 
 
 class ApkRequestHandler(SimpleHTTPRequestHandler):
-    def __init__(self, *args, target_apk_name=None, shutdown_callback=None, **kwargs):
+    def __init__(self, *args, target_apk_name=None, target_apk_path=None, shutdown_callback=None, **kwargs):
         self.target_apk_name = target_apk_name
+        self.target_apk_path = target_apk_path
         self.shutdown_callback = shutdown_callback
         super().__init__(*args, **kwargs)
 
     def log_message(self, format, *args):
         sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {format % args}\n")
 
-    def end_headers(self):
-        if self.path.endswith(".apk"):
-            self.send_header("Content-Type", "application/vnd.android.package-archive")
-            self.send_header("Content-Disposition", f'attachment; filename="{os.path.basename(self.path)}"')
-        super().end_headers()
+    def sanitize_filename(self, filename):
+        """Sanitize filename to prevent header injection in Content-Disposition."""
+        safe_name = os.path.basename(filename)
+        safe_name = re.sub(r'[^a-zA-Z0-9._-]', '_', safe_name)
+        return safe_name or "app.apk"
+
+    def do_HEAD(self):
+        parsed_path = unquote(urlparse(self.path).path).strip("/")
+        if parsed_path != self.target_apk_name:
+            self.send_error(404, "Not Found")
+            return
+        super().do_HEAD()
 
     def do_GET(self):
-        clean_path = self.path.strip("/").split("?")[0]
-        is_apk_request = clean_path == self.target_apk_name or clean_path.endswith(".apk")
+        # Strict routing: only serve the target APK file, disallow all other files and directory listings
+        parsed_path = unquote(urlparse(self.path).path).strip("/")
+
+        if parsed_path != self.target_apk_name:
+            self.send_error(404, "Not Found")
+            return
+
         client_ip = self.client_address[0]
 
-        super().do_GET()
+        # Trigger download callback when transfer begins
+        if self.shutdown_callback:
+            self.shutdown_callback(client_ip)
 
-        if is_apk_request:
-            if hasattr(self, "shutdown_callback") and self.shutdown_callback:
-                self.shutdown_callback(client_ip)
+        try:
+            super().do_GET()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.log_message("Client %s disconnected during APK download", client_ip)
+
+    def end_headers(self):
+        # Only attach APK download headers if this is a 200/206 response for the target APK
+        parsed_path = unquote(urlparse(self.path).path).strip("/")
+        if parsed_path == self.target_apk_name and getattr(self, "_headers_buffer", None):
+            status_line = self._headers_buffer[0].decode("latin-1") if self._headers_buffer else ""
+            if " 200 " in status_line or " 206 " in status_line:
+                safe_filename = self.sanitize_filename(self.target_apk_name)
+                self.send_header("Content-Type", "application/vnd.android.package-archive")
+                self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
+        super().end_headers()
 
 
 class ApkServerManager:
@@ -95,40 +130,57 @@ class ApkServerManager:
         self.directory = os.path.dirname(self.apk_path)
         self.apk_name = os.path.basename(self.apk_path)
         self.apk_size_mb = os.path.getsize(self.apk_path) / (1024 * 1024)
-        self.preferred_port = port
-        self.shutdown_delay = shutdown_delay
-        self.idle_timeout = idle_timeout
+        self.preferred_port = max(1, min(port, 65535))
+        self.shutdown_delay = max(0, shutdown_delay)
+        self.idle_timeout = max(0, idle_timeout)
 
         self.server = None
         self.port = None
         self.timer = None
         self.idle_timer = None
         self.shutdown_triggered = False
+        self._lock = threading.Lock()
 
     def on_download_started(self, client_ip):
-        if self.shutdown_triggered:
-            return
+        with self._lock:
+            if self.shutdown_triggered:
+                return
+            self.shutdown_triggered = True
 
-        print(f"\n[serve-apk] Download detected from {client_ip} for '{self.apk_name}'")
-        print(f"[serve-apk] Auto-shutdown countdown started: server will stop in {self.shutdown_delay}s ({self.shutdown_delay // 60} minutes).")
-        self.shutdown_triggered = True
+            print(f"\n[serve-apk] Download started by {client_ip} for '{self.apk_name}'")
+            print(f"[serve-apk] Auto-shutdown timer started: server will terminate in {self.shutdown_delay}s ({self.shutdown_delay // 60}m).")
 
-        if self.idle_timer:
-            self.idle_timer.cancel()
+            if self.idle_timer:
+                self.idle_timer.cancel()
+                self.idle_timer = None
 
-        self.timer = threading.Timer(self.shutdown_delay, self._shutdown_server)
-        self.timer.daemon = True
-        self.timer.start()
+            if self.shutdown_delay > 0:
+                self.timer = threading.Timer(self.shutdown_delay, self._shutdown_server)
+                self.timer.daemon = True
+                self.timer.start()
+            else:
+                self._shutdown_server()
 
     def _shutdown_server(self):
-        print("\n[serve-apk] Auto-shutdown timer expired. Shutting down HTTP server cleanly.")
+        print("\n[serve-apk] Auto-shutdown timer expired. Stopping HTTP server.")
         if self.server:
-            threading.Thread(target=self.server.shutdown).start()
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def _idle_timeout_reached(self):
-        print(f"\n[serve-apk] Idle timeout of {self.idle_timeout}s reached with no downloads. Shutting down.")
+        print(f"\n[serve-apk] Idle timeout of {self.idle_timeout}s reached with no downloads. Stopping HTTP server.")
         if self.server:
-            threading.Thread(target=self.server.shutdown).start()
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+    def _setup_signal_handlers(self):
+        def handle_sigterm(signum, frame):
+            print("\n[serve-apk] Received termination signal (SIGTERM). Stopping HTTP server.")
+            if self.server:
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+        try:
+            signal.signal(signal.SIGTERM, handle_sigterm)
+        except (ValueError, AttributeError):
+            pass
 
     def start(self):
         self.port = find_free_port(self.preferred_port)
@@ -138,11 +190,15 @@ class ApkServerManager:
                 *args,
                 directory=self.directory,
                 target_apk_name=self.apk_name,
+                target_apk_path=self.apk_path,
                 shutdown_callback=self.on_download_started,
                 **kwargs
             )
 
         self.server = ThreadingHTTPServer(("0.0.0.0", self.port), handler_factory)
+        self.server.daemon_threads = True
+
+        self._setup_signal_handlers()
 
         if self.idle_timeout > 0:
             self.idle_timer = threading.Timer(self.idle_timeout, self._idle_timeout_reached)
@@ -160,8 +216,8 @@ class ApkServerManager:
         for ip in ips["tailscale"]:
             print(f"  Tailscale:  http://{ip}:{self.port}/{self.apk_name}")
         print("-" * 60)
-        print(f"  • Auto-shutdown: 5 minutes after first download")
-        print(f"  • Idle timeout:  {self.idle_timeout // 60} minutes if no download occurs")
+        print(f"  • Auto-shutdown: {self.shutdown_delay // 60}m ({self.shutdown_delay}s) after download starts")
+        print(f"  • Idle timeout:  {self.idle_timeout // 60}m ({self.idle_timeout}s) if no download occurs")
         print(f"  • Stop manually: Ctrl+C")
         print("=" * 60 + "\n")
         sys.stdout.flush()
@@ -171,15 +227,16 @@ class ApkServerManager:
         except KeyboardInterrupt:
             print("\n[serve-apk] Interrupted by user. Shutting down.")
         finally:
-            if self.timer:
-                self.timer.cancel()
-            if self.idle_timer:
-                self.idle_timer.cancel()
+            with self._lock:
+                if self.timer:
+                    self.timer.cancel()
+                if self.idle_timer:
+                    self.idle_timer.cancel()
             self.server.server_close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Serve APK over HTTP with 5-minute auto-shutdown on download.")
+    parser = argparse.ArgumentParser(description="Serve APK over HTTP with auto-shutdown on download.")
     parser.add_argument("apk", help="Path to .apk file")
     parser.add_argument("--port", type=int, default=8080, help="Preferred port (default: 8080)")
     parser.add_argument("--delay", type=int, default=300, help="Shutdown delay in seconds after download (default: 300s / 5m)")

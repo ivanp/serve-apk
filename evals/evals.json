@@ -1,0 +1,17 @@
+{
+  "skill_name": "serve-apk",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "build apk and serve it so I can download it on my phone",
+      "expected_output": "Runs ./gradlew assembleDebug, starts scripts/serve.py with the generated apk, and outputs LAN/localhost download URLs with a 5-minute auto-shutdown on download.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "I already have an APK at app/build/outputs/apk/release/app-release.apk. Serve it over HTTP.",
+      "expected_output": "Directly invokes scripts/serve.py pointing to app/build/outputs/apk/release/app-release.apk without rebuilding, showing the download links.",
+      "files": []
+    }
+  ]
+}
